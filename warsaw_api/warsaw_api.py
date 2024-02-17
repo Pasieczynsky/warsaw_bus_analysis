@@ -4,16 +4,18 @@ from typing import Dict, Optional, Union
 import requests
 import os
 import json
+import concurrent.futures
 
 # time interval for downloading data from API
 TIME_INTERVAL = 10
 # delta time for validating buses data
 TIME_DELTA = 30
 
-# TODO: 
+# TODO:
 # - add terminal view:
 #   * asking to download data if exists already
 #   * progress bars or something like that
+
 
 class WarsawAPI:
     api_key: str
@@ -21,6 +23,7 @@ class WarsawAPI:
     bus_stop_url: str
     scheldue_url: str
     routes_url: str
+    dictionary_url: str
 
     def __init__(self, api_key):
         self.api_key = api_key
@@ -30,9 +33,17 @@ class WarsawAPI:
         self.routes_url = (
             "https://api.um.warszawa.pl/api/action/public_transport_routes/"
         )
+        self.dictionary_url = (
+            "https://api.um.warszawa.pl/api/action/public_transport_dictionary/"
+        )
 
+    # TODO: response is empty -> schedule not found, than not raise exception
+    # maybe add attribute MAX_REQUESTS to stop program after some time
     def __get_data_from_api(
-        self, url: str, params: Dict[str, Union[str, int, None]]
+        self,
+        url: str,
+        params: Dict[str, Union[str, int, None]],
+        is_schedule: bool = False,
     ) -> Dict:
         """
         Get data from Warsaw API
@@ -49,8 +60,14 @@ class WarsawAPI:
 
             # Check if response is valid
             if (len(response["result"]) == 0) or (isinstance(response["result"], str)):
-                error_counter += 1
-                if error_counter == 50:
+                if is_schedule:
+                    error_counter += 25
+                else:
+                    error_counter += 1
+                if error_counter >= 50:
+                    if is_schedule and len(response["result"]) == 0:
+                        # schedule could not be found (technical stops, etc.)
+                        return {}
                     # stop program and print response
                     raise ValueError(response)
                 time.sleep(0.5)
@@ -155,9 +172,9 @@ class WarsawAPI:
 
         return index + 1
 
-    def __parse_bus_stop_info(self, response: Dict) -> Dict:
+    def __parse_dict(self, response: Dict) -> Dict:
         """
-        Parse bus stop info from Warsaw API
+        Parse dict from Warsaw API to more readable and useable format
         response: Dict - response from Warsaw API
         """
         result = {}
@@ -182,7 +199,7 @@ class WarsawAPI:
         busStops = {}
 
         for stop in response:
-            stop = self.__parse_bus_stop_info(stop)
+            stop = self.__parse_dict(stop)
             key = stop["zespol"] + "_" + stop["slupek"]
             busStops[key] = stop
 
@@ -205,11 +222,127 @@ class WarsawAPI:
         }
 
         response = self.__get_data_from_api(self.routes_url, params)
-        
+
         path = os.path.join(path, "bus_stops", "routes.json")
         if not os.path.exists(os.path.dirname(path)):
             os.makedirs(os.path.dirname(path))
-        
+
         with open(path, "w") as f:
             json.dump(response, f)
-        
+
+    def download_dictionary(self, path: Optional[str] = os.getcwd()) -> None:
+        """
+        Download dictionaries of terms for urban transport
+        path: Optional[str] - path to directory where file will be saved
+        """
+
+        params = {
+            "apikey": self.api_key,
+        }
+
+        response = self.__get_data_from_api(self.dictionary_url, params)
+
+        path = os.path.join(path, "bus_stops", "dictionary.json")
+        if not os.path.exists(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path))
+
+        with open(path, "w") as f:
+            json.dump(response, f)
+
+    def __get_schedule(self, line: int, path: Optional[str] = os.getcwd()) -> None:
+        """
+        Download schedule from Warsaw API and save to file
+        line: int - line number
+        path: Optional[str] - path to directory where file will be saved
+        """
+
+        schedule_dir = os.path.join(path, "bus_stops", "lines")
+        routes = os.path.join(path, "bus_stops", "routes.json")
+        if not os.path.exists(routes):
+            raise ValueError(
+                "Public transport routes not found, please download routes first (download_routes)"
+            )
+
+        line_schedule = {}
+        line_stops = []
+
+        with open(routes, "r") as f:
+            data = json.load(f)
+            # collect all stops for line
+            for route_name in data[line]:
+                for stop_number in data[line][route_name]:
+                    line_stops.append(data[line][route_name][stop_number])
+
+            # collect schedule for each stop
+            for stop in range(len(line_stops)):
+                params = {
+                    "id": "e923fa0e-d96c-43f9-ae6e-60518c9f3238",
+                    "apikey": self.api_key,
+                    "busstopId": line_stops[stop]["nr_zespolu"],
+                    "busstopNr": line_stops[stop]["nr_przystanku"],
+                    "line": line,
+                }
+
+                # get schedule from API
+                response = self.__get_data_from_api(
+                    self.scheldue_url, params, is_schedule=True
+                )
+
+                if response == {}:  # schedule not found
+                    continue
+
+                bus_stop_key = (
+                    line_stops[stop]["nr_zespolu"]
+                    + "_"
+                    + line_stops[stop]["nr_przystanku"]
+                )
+                for schedule in response:
+                    schedule = self.__parse_dict(schedule)
+                    brigade = schedule["brygada"]
+                    # check if brigade exists in line_schedule
+                    if brigade not in line_schedule:
+                        line_schedule[brigade] = {}
+
+                    # check if bus_stop_key exists in line_schedule[brigade]
+                    if bus_stop_key not in line_schedule[brigade]:
+                        line_schedule[brigade][bus_stop_key] = []
+
+                    line_schedule[brigade][bus_stop_key].append(schedule["czas"])
+                    # line_schedule[brigade][bus_stop_key].append(schedule)
+
+        # create directory if not exists
+        if not os.path.exists(schedule_dir):
+            os.makedirs(schedule_dir)
+
+        # save schedule to file
+        path = os.path.join(schedule_dir, f"{line}.json")
+        with open(path, "w") as f:
+            json.dump(line_schedule, f)
+
+        print(f"Schedule for line {line} saved to file")
+
+    def download_schedule(self, path: Optional[str] = os.getcwd()) -> None:
+        """
+        Download schedule from Warsaw API and save to file
+        path: Optional[str] - path to directory where file will be saved
+        """
+
+        routes = os.path.join(path, "bus_stops", "routes.json")
+        if not os.path.exists(routes):
+            raise ValueError(
+                "Public transport routes not found, please download routes first (download_routes)"
+            )
+
+        with open(routes, "r") as f:
+            data = json.load(f)
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = []
+            for line in data:
+                if line > "999" or int(line) > 99:
+                    # only lines with letters and numbers greater than 99 (buses)
+                    print(f"Downloading schedule for line {line}")
+                    futures.append(executor.submit(self.__get_schedule, line, path))
+
+            # Wait for all futures to complete
+            concurrent.futures.wait(futures)
