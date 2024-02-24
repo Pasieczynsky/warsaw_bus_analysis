@@ -54,7 +54,7 @@ class Punctionality:
 
         Returns:
             str: The updated path.
-        
+
         Raises:
             ValueError: If the directory or file does not exist.
         """
@@ -88,6 +88,10 @@ class Punctionality:
         """
         Sets the path to save the prepared data.
         """
+        if path_to_save is not None:
+            self.path_to_save = path_to_save
+            return
+
         date = (
                 self.path_bus_location.split("_")[-2]
                 + "_"
@@ -102,6 +106,16 @@ class Punctionality:
         path = os.path.join(path, "punctionality_data_" + date + ".csv")
         self.path_to_save = path
 
+    def __load_bus_stops(self):
+        """
+        Loads the bus stops data from the file.
+
+        Returns:
+            dict: The bus stops data.
+        """
+        with open(self.path_stops, "r") as file:
+            return json.load(file)
+
     def prepare_data(self):
         """
         Prepares the data for analysis.
@@ -113,136 +127,207 @@ class Punctionality:
             "VehicleNumber,Line,Brigade,Stop,DiffTime,DiffDist,BusLat,BusLon\n"
         )
 
-        # Dict with the bus ID as the key
-        # Value is a list of dictionaries with bus_stops and the difference between actual and planned time
-        # bus -> bus_stop -> (diff_time, diff_dist)
         data_to_save = {}
-
-        # load bus stops data
-        with open(self.path_stops, "r") as file:
-            bus_stops = json.load(file)
-
+        bus_stops = self.__load_bus_stops()
         count_files = len(os.listdir(self.path_bus_location))
 
-        # iterate over all the files in the directory
+        # Iterate over all files with bus location data
         for i in range(count_files):
-            # open file with bus location
-            with open(
-                    os.path.join(self.path_bus_location, str(i) + ".json"), "r"
-            ) as file:
-                data = json.load(file)
+            data = self.__load_bus_location_data(self.path_bus_location, i)
+            schedule = {}
 
-                # iterate over all the buses
-                schedule = {}
-                for bus in data:
-                    if bus["Lines"] < "999":
-                        if int(bus["Lines"]) < 100:
-                            continue
-
-                    bus_id = get_busID(
-                        bus["VehicleNumber"], bus["Lines"], bus["Brigade"]
-                    )
-                    # load the schedule for the bus line if it is not already loaded
-                    if bus["Lines"] not in schedule:
-                        with open(
-                                os.path.join(self.path_schedule, bus["Lines"] + ".json"),
-                                "r",
-                        ) as f:
-                            schedule[bus["Lines"]] = json.load(f)
-
-                    # check if the bus brigade is in the schedule
-                    if bus["Brigade"] not in schedule[bus["Lines"]]:
+            # Iterate over all buses in the file
+            for bus in data:
+                # Skip trams (sometimes they are in the data, don't know why)
+                if bus["Lines"] < "999":
+                    if int(bus["Lines"]) < 100:
                         continue
 
-                    # check if the bus is in data_to_save
-                    if bus_id not in data_to_save:
-                        data_to_save[bus_id] = {}
+                bus_id = get_busID(bus["VehicleNumber"], bus["Lines"], bus["Brigade"])
+                schedule = self.__load_schedule(
+                    schedule, self.path_schedule, bus["Lines"]
+                )
 
-                    # find the closest bus stop to the bus
-                    delta_dist = 0.01  # distance in km
-                    closest_stop = None
-                    for stop in schedule[bus["Lines"]][bus["Brigade"]].keys():
-                        if stop not in bus_stops:
-                            continue
+                if bus["VehicleNumber"] == "1000" and bus["Lat"] == 52.22274:
+                    print(bus)
+                # check if the bus brigade is in the schedule
+                if bus["Brigade"] not in schedule[bus["Lines"]]:
+                    continue
 
-                        distance = calculate_distance(
-                            bus["Lat"],
-                            bus["Lon"],
-                            float(bus_stops[stop]["szer_geo"]),
-                            float(bus_stops[stop]["dlug_geo"]),
-                        )
+                closest_stop, delta_dist, min_time = self.__find_closest_stop(
+                    bus, schedule, bus_stops
+                )
 
-                        if distance < delta_dist:
-                            bus_time = datetime.strptime(
-                                bus["Time"], "%Y-%m-%d %H:%M:%S"
-                            ).strftime("%H:%M:%S")
-                            # find the closest time
-                            best_time = (
-                                3600  # difference between the actual and planned time
-                            )
-                            for stop_time in schedule[bus["Lines"]][bus["Brigade"]][
-                                stop
-                            ]:
-                                if int(stop_time[:2]) >= 24:
-                                    stop_time = (
-                                            str(int(stop_time[:2]) - 24) + stop_time[2:]
-                                    )
+                if closest_stop is None:
+                    continue
 
-                                diff = abs(
-                                    (
-                                            datetime.strptime(stop_time, "%H:%M:%S")
-                                            - datetime.strptime(bus_time, "%H:%M:%S")
-                                    ).seconds
-                                )
+                data_to_save = self.__update_data_to_save(
+                    data_to_save, bus_id, closest_stop, bus, min_time, delta_dist
+                )
 
-                                best_time = min(best_time, diff)
+                if data_to_save is None:
+                    continue
 
-                            # check if the time difference is not too big
-                            if best_time >= 3600:
-                                continue
-                            else:
-                                delta_dist = distance
-                                closest_stop = stop
-                        else:
-                            continue
-
-                    # any close stop found
-                    if closest_stop is None or best_time >= 3600:
-                        continue
-
-                    # check if the bus stop is in data_to_save
-                    if closest_stop not in data_to_save[bus_id]:
-                        data_to_save[bus_id][closest_stop] = (
-                            best_time,
-                            delta_dist,
-                            bus["Lat"],
-                            bus["Lon"],
-                        )
-                    else:
-                        # check if the time difference is smaller than the previous one
-                        if best_time < data_to_save[bus_id][closest_stop][0]:
-                            data_to_save[bus_id][closest_stop] = (
-                                best_time,
-                                delta_dist,
-                                bus["Lat"],
-                                bus["Lon"],
-                            )
-                        else:
-                            continue
             print(f"File {i} of {count_files - 1} done")
 
-        # save the data to the file
+        self.__save_data_to_file(data_to_save, file_to_save)
+        file_to_save.close()
+
+    @staticmethod
+    def __load_bus_location_data(path_bus_location, file_index):
+        """
+        Loads the bus location data from the file.
+
+        Args:
+            path_bus_location (str): Path to the directory containing bus location data.
+            file_index (int): Index of the file to load.
+
+        Returns:
+            list: The bus location data.
+        """
+        with open(
+                os.path.join(path_bus_location, str(file_index) + ".json"), "r"
+        ) as file:
+            return json.load(file)
+
+    @staticmethod
+    def __load_schedule(schedule, path_schedule, bus_line):
+        """
+        Loads the schedule data from the file.
+
+        Args:
+            schedule (dict): The current schedule data.
+            path_schedule (str): Path to the directory containing schedule data.
+            bus_line (str): The bus line.
+
+        Returns:
+            dict: The updated schedule data.
+        """
+        if bus_line not in schedule:
+            with open(os.path.join(path_schedule, bus_line + ".json"), "r") as f:
+                schedule[bus_line] = json.load(f)
+        return schedule
+
+    @staticmethod
+    def __find_closest_stop(bus, schedule, bus_stops):
+        """
+        Finds the closest bus stop for a given bus.
+
+        Args:
+            bus (dict): The bus data.
+            schedule (dict): The schedule data.
+            bus_stops (dict): The bus stops data.
+
+        Returns:
+            tuple: The closest stop, delta distance, and minimum time difference.
+        """
+        delta_dist = 0.01  # 10 meters
+        closest_stop = None
+        # Minimum time difference in seconds
+        # Starting with 1 hour, because there should be
+        # no bus that is late for more than 1 hour
+        min_time = 3600
+
+        for stop in schedule[bus["Lines"]][bus["Brigade"]].keys():
+            if stop not in bus_stops:
+                continue
+
+            distance = calculate_distance(
+                bus["Lat"],
+                bus["Lon"],
+                float(bus_stops[stop]["szer_geo"]),
+                float(bus_stops[stop]["dlug_geo"]),
+            )
+
+            if distance < delta_dist:
+                bus_time = datetime.strptime(bus["Time"], "%Y-%m-%d %H:%M:%S").strftime(
+                    "%H:%M:%S"
+                )
+
+                for stop_time in schedule[bus["Lines"]][bus["Brigade"]][stop]:
+                    # Fix date from schedule (like 25:00:00 -> 01:00:00)
+                    if int(stop_time[:2]) >= 24:
+                        stop_time = str(int(stop_time[:2]) - 24) + stop_time[2:]
+
+                    diff = abs(
+                        (
+                                datetime.strptime(stop_time, "%H:%M:%S")
+                                - datetime.strptime(bus_time, "%H:%M:%S")
+                        ).seconds
+                    )
+
+                    min_time = min(min_time, diff)
+
+                # Any bus that is late for more than 1 hour is not considered
+                if min_time >= 3600:
+                    continue
+                else:
+                    delta_dist = distance
+                    closest_stop = stop
+            else:
+                continue
+
+        return closest_stop, delta_dist, min_time
+
+    @staticmethod
+    def __update_data_to_save(
+            data_to_save: dict, bus_id, closest_stop, bus, time, delta_dist
+    ):
+        """
+        Updates the data to save.
+
+        Args:
+            data_to_save (dict): The current data to save.
+            bus_id (tuple): The bus ID.
+            closest_stop (str): The closest bus stop.
+            bus (dict): The bus data.
+            time (int): The time difference.
+            delta_dist (float): The distance difference.
+
+        Returns:
+            dict: The updated data to save.
+        """
+        if bus_id not in data_to_save.keys():
+            data_to_save[bus_id] = {}
+
+        # If the bus stop is not in the data, add it
+        if closest_stop not in data_to_save[bus_id]:
+            data_to_save[bus_id][closest_stop] = (
+                time,
+                delta_dist,
+                bus["Lat"],
+                bus["Lon"],
+            )
+
+        elif time < data_to_save[bus_id][closest_stop][0]:
+            data_to_save[bus_id][closest_stop] = (
+                time,
+                delta_dist,
+                bus["Lat"],
+                bus["Lon"],
+            )
+
+        return data_to_save
+
+    @staticmethod
+    def __save_data_to_file(data_to_save, file_to_save):
+        """
+        Saves the data to a file.
+
+        Args:
+            data_to_save (dict): The data to save.
+            file_to_save (file): The file to save the data to.
+        """
         for bus in data_to_save:
             vehicle_number = bus[0]
             line = bus[1]
             brigade = bus[2]
+
             for stop in data_to_save[bus]:
                 file_to_save.write(
                     f"{vehicle_number},{line},{brigade},{stop},{data_to_save[bus][stop][0]},"
                     f"{data_to_save[bus][stop][1]},{data_to_save[bus][stop][2]},{data_to_save[bus][stop][3]}\n"
                 )
-
-        file_to_save.close()
 
     def get_data(self):
         """
